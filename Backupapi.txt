@@ -1,0 +1,243 @@
+import pandas as pd
+import chromadb
+import torch
+from transformers import BertTokenizer, BertModel
+from flask import Flask, request, jsonify, redirect
+from flasgger import Swagger
+import numpy as np
+
+# Define file paths and ChromaDB settings
+chroma_db_path = "D:/project/Food recommendation/Backend/Chromadb"  # Directory for ChromaDB persistence
+collection_name = "recipes"
+
+# Initialize ChromaDB client
+client = chromadb.PersistentClient(
+    path=chroma_db_path
+)
+
+# Load the existing collection
+collection = client.get_collection(name=collection_name)
+
+
+# Load pre-trained BERT model and tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertModel.from_pretrained('bert-base-uncased')
+
+# Initialize Flask app and Swagger
+app = Flask(__name__)
+swagger = Swagger(app)
+
+def embed_text(text):
+    """Embed the input text using BERT."""
+    inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    # Get the mean of the last hidden state to obtain a single vector representation
+    embeddings = outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+    return embeddings
+
+def embed_recipe(title, ingredients, directions):
+    """Embed the recipe components and average the embeddings."""
+    # Embed title
+    title_embedding = embed_text(title)
+
+    # Embed ingredients
+    ingredient_embeddings = []
+    for ingredient in ingredients:
+        ingredient_embedding = embed_text(ingredient)
+        ingredient_embeddings.append(ingredient_embedding)
+
+    # Embed directions
+    direction_embedding = embed_text(directions)
+
+    # Calculate average embedding
+    all_embeddings = [title_embedding] + ingredient_embeddings + [direction_embedding]
+    average_embedding = np.mean(all_embeddings, axis=0)
+
+    return average_embedding
+
+@app.route('/')
+def index():
+    """Redirect root URL to Swagger UI."""
+    return redirect('/apidocs/')
+
+@app.route('/api/add_recipe', methods=['POST'])
+def add_recipe():
+    """API endpoint to add a new recipe to the ChromaDB collection.
+    ---
+    parameters:
+      - name: recipe
+        in: body
+        required: true
+        schema:
+          type: object
+          properties:
+            title:
+              type: string
+              example: "Spaghetti Carbonara"
+            ingredients:
+              type: array
+              items:
+                type: string
+              example: ["spaghetti", "eggs", "parmesan cheese", "pancetta"]
+            directions:
+              type: string
+              example: "Boil spaghetti. Cook pancetta. Mix all ingredients."
+    responses:
+      201:
+        description: Recipe added successfully.
+      400:
+        description: Invalid input data.
+    """
+    data = request.get_json()
+    title = data.get('title')
+    ingredients = data.get('ingredients')
+    directions = data.get('directions')
+
+    if not title or not ingredients or not directions:
+        return jsonify({"error": "Title, ingredients, and directions are required"}), 400
+
+    # Create a recipe entry
+    recipe_entry = {
+        "title": title,
+        "ingredients": ingredients,
+        "directions": directions
+    }
+
+    # Embed the recipe components and calculate average embedding
+    embedding = embed_recipe(title, ingredients, directions)
+
+    # Add the recipe to ChromaDB
+    collection.add(
+        documents=[title],
+        metadatas=[recipe_entry],
+        embeddings=[embedding]
+    )
+
+    return jsonify({"message": "Recipe added successfully."}), 201
+
+@app.route('/api/find_similar', methods=['POST'])
+def find_similar():
+    """API endpoint to find the 10 most similar recipes based on user input.
+    ---
+    parameters:
+      - name: query
+        in: body
+        required: true
+        schema:
+          type: object
+          properties:
+            query:
+              type: string
+              example: "I want to make a chicken recipe"
+    responses:
+      200:
+        description: Similar recipes found.
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              title:
+                type: string
+                example: "Spaghetti Carbonara"
+              metadata:
+                type: object
+                example: {"ingredients": ["spaghetti", "eggs", "parmesan cheese", "pancetta"]}
+      400:
+        description: No query provided.
+      404:
+        description: No similar recipes found.
+    """
+    data = request.get_json()
+    user_input = data.get('query')
+
+    if not user_input:
+        return jsonify({"error": "No query provided"}), 400
+
+    # Embed the user input
+    user_embedding = embed_text(user_input)
+
+    # Query ChromaDB for the most similar documents using the embedded input
+    results = collection.query(
+        query_embeddings=[user_embedding],
+        n_results=10  # Get the top 10 similar documents
+    )
+
+    if results and results['documents']:
+        response = []
+        for i in range(len(results['documents'])):
+            response.append({
+                "title": results['documents'][i],
+                "metadata": results['metadatas'][i]
+            })
+        return jsonify(response), 200
+    else:
+        return jsonify({"message": "No similar recipes found."}), 404
+
+@app.route('/api/find_similar_with_accuracy', methods=['POST'])
+def find_similar_with_accuracy():
+    """API endpoint to find the 10 most similar recipes based on user input with accuracy.
+    ---
+    parameters:
+      - name: query
+        in: body
+        required: true
+        schema:
+          type: object
+          properties:
+            query:
+              type: string
+              example: "I want to make a chicken recipe"
+    responses:
+      200:
+        description: Similar recipes found with accuracy.
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              title:
+                type: string
+                example: "Spaghetti Carbonara"
+              metadata:
+                type: object
+                example: {"ingredients": ["spaghetti", "eggs", "parmesan cheese", "pancetta"]}
+              accuracy:
+                type: number
+                format: float
+                example: 0.95
+      400:
+        description: No query provided.
+      404:
+        description: No similar recipes found.
+    """
+    data = request.get_json()
+    user_input = data.get('query')
+
+    if not user_input:
+        return jsonify({"error": "No query provided"}), 400
+
+    # Embed the user input
+    user_embedding = embed_text(user_input)
+
+    # Query ChromaDB for the most similar documents using the embedded input
+    results = collection.query(
+        query_embeddings=[user_embedding],
+        n_results=10  # Get the top 10 similar documents
+    )
+
+    if results and results['documents']:
+        response = []
+        for i in range(len(results['documents'])):
+            response.append({
+                "title": results['documents'][i],
+                "metadata": results['metadatas'][i],
+                "accuracy": round(1 / (results['distances'][i] + 1e-10), 2)  # Example accuracy calculation
+            })
+        return jsonify(response), 200
+    else:
+        return jsonify({"message": "No similar recipes found."}), 404
+
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)
